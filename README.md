@@ -12,11 +12,6 @@ This directory contains a reference implementation of an OpenID Provider (OP) fo
 1. Copy `config.json.example` to `config.json` and fill in your deployment-specific values.
 2. Build and run the OP:
    ```bash
-   go build -o op op.go
-   ./op
-1. Copy `config.json.example` to `config.json` and fill in your deployment-specific values.
-2. Build and run the OP:
-   ```bash
    go build -o proxy proxy.go
    ./proxy
    ```
