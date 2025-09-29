@@ -34,13 +34,12 @@ func randomString(n int) string {
 
 // Config struct for OP settings
 type Config struct {
-	Issuer               string   `json:"issuer"`
 	EntityID             string   `json:"entity_id"`
 	TrustAnchors         []string `json:"trust_anchors"`
-	ClientID             string   `json:"client_id"`
 	UpstreamOIDCProvider string   `json:"upstream_oidc_provider"`
 	UpstreamClientID     string   `json:"upstream_client_id"`
 	UpstreamClientSecret string   `json:"upstream_client_secret"`
+	Port                 int      `json:"port"`
 }
 
 var (
@@ -128,7 +127,6 @@ func main() {
 			"status":             "healthy",
 			"service":            "Federation OP",
 			"entity_id":          config.EntityID,
-			"issuer":             config.Issuer,
 			"trust_anchors":      config.TrustAnchors,
 			"timestamp":          time.Now().Unix(),
 			"registered_clients": clients,
@@ -406,10 +404,9 @@ func main() {
 		if aud != config.EntityID {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register JWT aud mismatch: got %s, expected %s", aud, config.ClientID)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "jwt_aud_mismatch",
-				"details": fmt.Sprintf("aud claim mismatch: got %s, expected %s", aud, config.ClientID),
+				"details": fmt.Sprintf("aud claim mismatch: got %s, expected %s", aud, config.EntityID),
 			})
 			return
 		}
@@ -691,7 +688,7 @@ func main() {
 			_, _, err := new(jwt.Parser).ParseUnverified(idTokenRaw, &claims)
 			if err == nil {
 				// Adjust claims: set iss and aud
-				claims["iss"] = config.Issuer
+				claims["iss"] = config.EntityID
 				claims["aud"] = clientID
 				// Re-sign id_token
 				newToken := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
@@ -731,16 +728,14 @@ func main() {
 			fmt.Fprint(w, "Failed to decode upstream userinfo response")
 			return
 		}
-		// Rewrite 'aud' and 'iss' claims
-		claims["aud"] = config.ClientID
-		claims["iss"] = config.Issuer
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		json.NewEncoder(w).Encode(claims)
 	})
 
-	log.Println("Federation-compliant Test OP running on :8083")
-	http.ListenAndServe(":8083", nil)
+	addr := fmt.Sprintf(":%d", config.Port)
+	log.Printf("Federation-compliant Test OP running on %s", addr)
+	http.ListenAndServe(addr, nil)
 }
 
 func writeClientRegistrationResponse(w http.ResponseWriter, clientID, clientSecret string, issuedAt int64, redirectURIs []string, mode string) {
