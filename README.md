@@ -2,7 +2,6 @@
 
 This directory contains a reference implementation of an OpenID Provider (OP) for OpenID Connect Federation.
 
-## Features
 - Dynamic client registration
 - Federation entity statement endpoints
 - OIDC proxy endpoints (authorize, token, userinfo)
@@ -15,13 +14,13 @@ This directory contains a reference implementation of an OpenID Provider (OP) fo
    ```bash
    go build -o op op.go
    ./op
+1. Copy `config.json.example` to `config.json` and fill in your deployment-specific values.
+2. Build and run the OP:
+   ```bash
+   go build -o proxy proxy.go
+   ./proxy
    ```
 3. The OP will listen on port 8083 by default.
-
-## Configuration
-- See `config.json.example` for required fields.
-- Never commit your real `config.json` with secrets to version control.
-
 ## Endpoints
 - `/.well-known/openid-federation` — Entity statement
 - `/jwks` — JWKS endpoint
