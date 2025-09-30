@@ -155,6 +155,20 @@ func main() {
 		json.NewEncoder(w).Encode(jwks)
 	})
 
+	// Federation /fetch endpoint
+	http.HandleFunc("/fetch", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[DEBUG] /fetch: %s %s from %s, params: %v", r.Method, r.URL.Path, r.RemoteAddr, r.URL.RawQuery)
+		jwtStr, err := buildEntityStatementDynamic(upstreamMetadata)
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprint(w, err.Error())
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/entity-statement+jwt")
+		fmt.Fprint(w, jwtStr)
+	})
+
 	// Federation /resolve endpoint
 	http.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[DEBUG] /resolve: %s %s from %s, params: %v", r.Method, r.URL.Path, r.RemoteAddr, r.URL.RawQuery)
@@ -165,7 +179,7 @@ func main() {
 			return
 		}
 		if sub == config.EntityID {
-			// Return entity statement for OP itself
+			// Directly return OP's own entity statement
 			jwtStr, err := buildEntityStatementDynamic(upstreamMetadata)
 			if err != nil {
 				w.WriteHeader(500)
@@ -173,10 +187,11 @@ func main() {
 				return
 			}
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Content-Type", "application/jwt")
+			w.Header().Set("Content-Type", "application/entity-statement+jwt")
 			fmt.Fprint(w, jwtStr)
 			return
 		}
+
 		// Check if sub matches a registered RP
 		for _, reg := range registeredClients {
 			log.Println("[DEBUG] Checking registered client with redirect URIs:", reg.RedirectURIs)
@@ -763,8 +778,16 @@ func buildEntityStatementDynamic(upstreamMetadata map[string]interface{}) (strin
 		"jwks":            jwks,
 		"authority_hints": config.TrustAnchors,
 		"metadata": map[string]interface{}{
+			"federation_entity": map[string]interface{}{
+				"federation_fetch_endpoint":   config.EntityID + "/fetch",
+				"federation_list_endpoint":    config.EntityID + "/list",
+				"federation_resolve_endpoint": config.EntityID + "/resolve",
+				"federation_health_endpoint":  config.EntityID + "/health",
+				"jwks_endpoint":               config.EntityID + "/jwks",
+			},
 			"openid_provider": map[string]interface{}{
 				"issuer":                                config.EntityID,
+				"registration_endpoint":                 config.EntityID + "/register",
 				"authorization_endpoint":                config.EntityID + "/authorize",
 				"token_endpoint":                        config.EntityID + "/token",
 				"userinfo_endpoint":                     config.EntityID + "/userinfo",
