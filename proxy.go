@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -32,14 +33,15 @@ func randomString(n int) string {
 	return string(b)
 }
 
-// Config struct for OP settings
+// / Config struct for OP settings
 type Config struct {
 	EntityID             string   `json:"entity_id"`
+	EntityName           string   `json:"entity_name"` // Add this line
 	TrustAnchors         []string `json:"trust_anchors"`
 	UpstreamOIDCProvider string   `json:"upstream_oidc_provider"`
 	UpstreamClientID     string   `json:"upstream_client_id"`
 	UpstreamClientSecret string   `json:"upstream_client_secret"`
-	Port                 int      `json:"port"`
+	Subordinates         []string `json:"subordinates"`
 }
 
 var (
@@ -54,6 +56,7 @@ var (
 		ProxyCodeChallenge    string
 	})
 	config     Config
+	port       string
 	privateKey *ecdsa.PrivateKey
 	publicKey  ecdsa.PublicKey
 	jwks       map[string]interface{}
@@ -76,6 +79,11 @@ func main() {
 	}
 	if err := json.Unmarshal(cfgData, &config); err != nil {
 		log.Fatalf("Failed to parse config: %v", err)
+	}
+
+	port = os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Default port
 	}
 
 	// Generate EC key
@@ -127,7 +135,9 @@ func main() {
 			"status":             "healthy",
 			"service":            "Federation OP",
 			"entity_id":          config.EntityID,
+			"entity_name":        config.EntityName, // Add this line
 			"trust_anchors":      config.TrustAnchors,
+			"subordinates":       config.Subordinates,
 			"timestamp":          time.Now().Unix(),
 			"registered_clients": clients,
 		}
@@ -171,73 +181,81 @@ func main() {
 
 	// Federation /resolve endpoint
 	http.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[DEBUG] /resolve: %s %s from %s, params: %v", r.Method, r.URL.Path, r.RemoteAddr, r.URL.RawQuery)
-		sub := r.URL.Query().Get("sub")
-		if sub == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(w, "sub parameter required")
+		entityID := r.URL.Query().Get("sub")
+		trustAnchor := r.URL.Query().Get("trust_anchor") // Add support for this parameter too
+
+		if entityID == "" {
+			http.Error(w, "Missing sub parameter", http.StatusBadRequest)
 			return
 		}
-		if sub == config.EntityID {
-			// Directly return OP's own entity statement
-			jwtStr, err := buildEntityStatementDynamic(upstreamMetadata)
+
+		log.Printf("[DEBUG] Resolving entity: %s (trust_anchor: %s)", entityID, trustAnchor)
+
+		// Check if it's ourselves
+		if entityID == config.EntityID {
+			log.Printf("[DEBUG] Entity is ourselves, returning self statement")
+			statement, err := buildEntityStatementDynamic(upstreamMetadata)
 			if err != nil {
-				w.WriteHeader(500)
-				fmt.Fprint(w, err.Error())
+				log.Printf("[ERROR] Failed to build entity statement: %v", err)
+				http.Error(w, "Failed to build entity statement", http.StatusInternalServerError)
 				return
 			}
-			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Content-Type", "application/entity-statement+jwt")
-			fmt.Fprint(w, jwtStr)
+			w.Write([]byte(statement))
 			return
 		}
 
-		// Check if sub matches a registered RP
-		for _, reg := range registeredClients {
-			log.Println("[DEBUG] Checking registered client with redirect URIs:", reg.RedirectURIs)
+		// Check if it's a subordinate
+		for _, sub := range config.Subordinates {
+			if sub == entityID {
+				log.Printf("[DEBUG] Found matching subordinate: %s", entityID)
 
-			if reg.EntityID != sub {
-				continue
-			}
-
-			log.Println("[DEBUG] Matched entity ID:", sub, "now checking redirect URIs...")
-			for _, uri := range reg.RedirectURIs {
-				log.Println("[DEBUG] Comparing with URI:", uri)
-
-				if uri == sub {
-					// Build entity statement for RP
-					claims := jwt.MapClaims{
-						"iss":             config.EntityID,
-						"sub":             sub,
-						"iat":             time.Now().Unix(),
-						"exp":             time.Now().Add(24 * time.Hour).Unix(),
-						"jwks":            jwks,
-						"authority_hints": config.TrustAnchors,
-						"metadata": map[string]interface{}{
-							"openid_relying_party": map[string]interface{}{
-								"redirect_uris": reg.RedirectURIs,
-							},
-						},
-					}
-					jwtTok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-					jwtTok.Header["kid"] = kid
-					jwtTok.Header["typ"] = "entity-statement+jwt"
-					jwtStr, err := jwtTok.SignedString(privateKey)
-					if err != nil {
-						log.Println("[DEBUG] Error signing JWT:", err)
-						w.WriteHeader(500)
-						fmt.Fprint(w, err.Error())
-						return
-					}
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-					w.Header().Set("Content-Type", "application/jwt")
-					fmt.Fprint(w, jwtStr)
+				// Fetch subordinate's self-issued entity statement
+				subStatement, err := fetchSubordinateStatement(entityID)
+				if err != nil {
+					log.Printf("[ERROR] Failed to fetch subordinate statement: %v", err)
+					http.Error(w, "Entity statement not found", http.StatusNotFound)
 					return
 				}
+
+				log.Printf("[DEBUG] Successfully fetched subordinate statement")
+
+				// Create a NEW statement signed by THIS trust anchor
+				// This is the key fix - the issuer must be the trust anchor, not the subordinate
+				now := time.Now().Unix()
+				resolvedClaims := jwt.MapClaims{
+					"iss":             config.EntityID, // ⭐ Trust anchor as issuer
+					"sub":             entityID,        // ⭐ Subordinate as subject
+					"iat":             now,
+					"exp":             now + 3600,
+					"metadata":        subStatement["metadata"],
+					"jwks":            subStatement["jwks"],
+					"authority_hints": []string{config.EntityID}, // Point back to this trust anchor
+				}
+
+				// Sign the statement with trust anchor's key
+				token := jwt.NewWithClaims(jwt.SigningMethodES256, resolvedClaims)
+				token.Header["kid"] = kid
+				token.Header["typ"] = "entity-statement+jwt"
+
+				jwtStr, err := token.SignedString(privateKey)
+				if err != nil {
+					log.Printf("[ERROR] Failed to sign statement: %v", err)
+					http.Error(w, "Failed to sign statement", http.StatusInternalServerError)
+					return
+				}
+
+				log.Printf("[DEBUG] Successfully resolved subordinate: %s with iss=%s, sub=%s",
+					entityID, config.EntityID, entityID)
+				w.Header().Set("Content-Type", "application/entity-statement+jwt")
+				w.Write([]byte(jwtStr))
+				return
 			}
 		}
-		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, "No entity statement found for sub: %s", sub)
+
+		// Entity not found
+		log.Printf("[DEBUG] Entity not found in subordinates: %s", entityID)
+		http.Error(w, fmt.Sprintf("No entity statement found for sub: %s", entityID), http.StatusNotFound)
 	})
 
 	// OIDC dynamic client registration endpoint
@@ -511,46 +529,99 @@ func main() {
 		writeClientRegistrationResponse(w, generatedClientID, generatedClientSecret, issuedAt, redirectURIs, "new")
 	})
 
-	// Federation /list endpoint
+	// Add a separate function to handle the /list endpoint
 	http.HandleFunc("/list", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[DEBUG] /list: %s %s from %s, params: %v", r.Method, r.URL.Path, r.RemoteAddr, r.URL.RawQuery)
-		entities := map[string]interface{}{
-			config.EntityID: map[string]interface{}{
-				"metadata": map[string]interface{}{
-					"openid_provider": map[string]interface{}{
-						"issuer":                                config.EntityID,
-						"authorization_endpoint":                config.EntityID + "/authorize",
-						"token_endpoint":                        config.EntityID + "/token",
-						"userinfo_endpoint":                     config.EntityID + "/userinfo",
-						"jwks_uri":                              config.EntityID + "/jwks",
-						"response_types_supported":              upstreamMetadata["response_types_supported"],
-						"subject_types_supported":               upstreamMetadata["subject_types_supported"],
-						"id_token_signing_alg_values_supported": upstreamMetadata["id_token_signing_alg_values_supported"],
-						"scopes_supported":                      upstreamMetadata["scopes_supported"],
-						"token_endpoint_auth_methods_supported": upstreamMetadata["token_endpoint_auth_methods_supported"],
-					},
-				},
-			},
+		log.Printf("[DEBUG] /list endpoint called")
+
+		// Build list of entities
+		entities := make(map[string]interface{})
+
+		// Add self as an available OpenID Provider since we have OP metadata
+		selfStatement, err := buildEntityStatementDynamic(upstreamMetadata)
+		if err == nil {
+			// Parse self statement to include in list
+			parts := strings.Split(selfStatement, ".")
+			if len(parts) == 3 {
+				payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+				if err == nil {
+					var selfClaims map[string]interface{}
+					if json.Unmarshal(payload, &selfClaims) == nil {
+						// Since we have OpenID Provider metadata, include ourselves
+						if metadata, ok := selfClaims["metadata"].(map[string]interface{}); ok {
+							if _, hasOP := metadata["openid_provider"]; hasOP {
+								// Create entity entry for ourselves
+								selfEntity := map[string]interface{}{
+									"iss":             config.EntityID,
+									"sub":             config.EntityID,
+									"iat":             time.Now().Unix(),
+									"exp":             time.Now().Add(24 * time.Hour).Unix(),
+									"metadata":        metadata,
+									"jwks":            selfClaims["jwks"],
+									"authority_hints": config.TrustAnchors,
+								}
+								entities[config.EntityID] = selfEntity
+								log.Printf("[DEBUG] Added self as OpenID Provider to list: %s", config.EntityID)
+							}
+						}
+					}
+				}
+			}
 		}
+
+		// Add subordinates that are NOT ourselves
+		for _, sub := range config.Subordinates {
+			if sub == config.EntityID {
+				continue // Skip self, already handled above
+			}
+
+			log.Printf("[DEBUG] Processing subordinate for list: %s", sub)
+
+			// Fetch fresh entity statement from subordinate
+			subStatement, err := fetchSubordinateStatement(sub)
+			if err != nil {
+				log.Printf("[WARN] Failed to fetch statement for subordinate %s: %v", sub, err)
+				continue
+			}
+
+			// Create a trust-anchor-issued version of the subordinate's metadata
+			subordinateEntity := map[string]interface{}{
+				"iss":             config.EntityID, // Trust anchor as issuer
+				"sub":             sub,             // Subordinate as subject
+				"iat":             time.Now().Unix(),
+				"exp":             time.Now().Add(24 * time.Hour).Unix(),
+				"metadata":        subStatement["metadata"],
+				"jwks":            subStatement["jwks"],
+				"authority_hints": []string{config.EntityID},
+			}
+
+			entities[sub] = subordinateEntity
+			log.Printf("[DEBUG] Added subordinate %s to list", sub)
+		}
+
+		// Build entity list claims
 		claims := jwt.MapClaims{
-			"iss":      config.EntityID,
-			"sub":      config.EntityID,
+			"iss":      config.EntityID, // Trust anchor as issuer
+			"sub":      config.EntityID, // Trust anchor as subject for the list itself
 			"iat":      time.Now().Unix(),
 			"exp":      time.Now().Add(24 * time.Hour).Unix(),
 			"entities": entities,
 		}
+
+		// Sign and return the entity list JWT
 		jwtTok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 		jwtTok.Header["kid"] = kid
-		jwtTok.Header["typ"] = "entity-list+jwt"
+		jwtTok.Header["typ"] = "entity-statement+jwt"
+
 		jwtStr, err := jwtTok.SignedString(privateKey)
 		if err != nil {
-			w.WriteHeader(500)
-			fmt.Fprint(w, err.Error())
+			log.Printf("[ERROR] Failed to sign entity list: %v", err)
+			http.Error(w, "Failed to sign entity list", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Content-Type", "application/jwt")
-		fmt.Fprint(w, jwtStr)
+
+		log.Printf("[DEBUG] Generated entity list with %d entities", len(entities))
+		w.Header().Set("Content-Type", "application/entity-statement+jwt")
+		w.Write([]byte(jwtStr))
 	})
 
 	// Proxy /authorize endpoint with state/nonce/pkce mapping
@@ -748,9 +819,8 @@ func main() {
 		json.NewEncoder(w).Encode(claims)
 	})
 
-	addr := fmt.Sprintf(":%d", config.Port)
-	log.Printf("Federation-compliant Test OP running on %s", addr)
-	http.ListenAndServe(addr, nil)
+	log.Printf("Federation-compliant Test OP running on %s", port)
+	http.ListenAndServe(":"+port, nil)
 }
 
 func writeClientRegistrationResponse(w http.ResponseWriter, clientID, clientSecret string, issuedAt int64, redirectURIs []string, mode string) {
@@ -770,6 +840,7 @@ func writeClientRegistrationResponse(w http.ResponseWriter, clientID, clientSecr
 }
 
 func buildEntityStatementDynamic(upstreamMetadata map[string]interface{}) (string, error) {
+	// This function should only describe the trust anchor itself, not subordinates
 	claims := jwt.MapClaims{
 		"iss":             config.EntityID,
 		"sub":             config.EntityID,
@@ -784,9 +855,11 @@ func buildEntityStatementDynamic(upstreamMetadata map[string]interface{}) (strin
 				"federation_resolve_endpoint": config.EntityID + "/resolve",
 				"federation_health_endpoint":  config.EntityID + "/health",
 				"jwks_endpoint":               config.EntityID + "/jwks",
+				"organization_name":           config.EntityName,
 			},
 			"openid_provider": map[string]interface{}{
 				"issuer":                                config.EntityID,
+				"display_name":                          config.EntityName, // Add this
 				"registration_endpoint":                 config.EntityID + "/register",
 				"authorization_endpoint":                config.EntityID + "/authorize",
 				"token_endpoint":                        config.EntityID + "/token",
@@ -800,12 +873,57 @@ func buildEntityStatementDynamic(upstreamMetadata map[string]interface{}) (strin
 			},
 		},
 	}
+
 	jwtTok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	jwtTok.Header["kid"] = kid
 	jwtTok.Header["typ"] = "entity-statement+jwt"
-	return jwtTok.SignedString(privateKey)
+
+	result, err := jwtTok.SignedString(privateKey)
+	if err != nil {
+		return "", err
+	}
+
+	return result, nil
 }
 
 func base64url(b []byte) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString(b), "=")
+}
+
+// fetchSubordinateStatement fetches the entity statement from a subordinate
+func fetchSubordinateStatement(entityID string) (map[string]interface{}, error) {
+	wellKnownURL := fmt.Sprintf("%s/.well-known/openid-federation", entityID)
+
+	resp, err := http.Get(wellKnownURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch subordinate statement: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("subordinate statement request failed with status %d", resp.StatusCode)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read subordinate statement: %w", err)
+	}
+
+	// Parse the JWT
+	parts := strings.Split(string(body), ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid JWT format in subordinate statement")
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode subordinate statement payload: %w", err)
+	}
+
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("failed to parse subordinate statement claims: %w", err)
+	}
+
+	return claims, nil
 }
