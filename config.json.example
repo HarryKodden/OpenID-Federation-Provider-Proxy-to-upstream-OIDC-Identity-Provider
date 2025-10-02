@@ -4,6 +4,10 @@
   "trust_anchors": [
     "https://your-trust-anchor.example.com"
   ],
+  "subordinates": [
+    "https://your-op.example.com",
+    "https://your-rp.example.com"
+  ],
   "upstream_oidc_provider": "https://your-upstream-idp.example.com",
   "upstream_client_id": "your-upstream-client-id",
   "upstream_client_secret": "your-upstream-client-secret"

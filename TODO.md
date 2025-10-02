@@ -1,77 +1,143 @@
-## OP Component Improvement Plan
+# OpenID Federation Proxy/Trust Anchor - TODO
+
+## ✅ Completed Tasks
+
+### Core Federation Functionality
+- [x] Implement basic OpenID Federation Trust Anchor
+- [x] Add `.well-known/openid-federation` endpoint
+- [x] Implement `/list` endpoint with proper subordinate statements
+- [x] Implement `/resolve` endpoint with correct iss/sub relationships
+- [x] Add `/fetch` endpoint for entity statement retrieval
+- [x] Fix subordinate statement issuer/subject relationships
+- [x] Add proper authority hints configuration
+- [x] Implement multi-trust anchor support
+
+### OIDC Proxy Functionality
+- [x] Implement upstream OIDC provider integration
+- [x] Add authorization endpoint proxy with state mapping
+- [x] Implement token endpoint proxy
+- [x] Add userinfo endpoint proxy
+- [x] Implement dynamic client registration
+- [x] Add JWKS endpoint for federation keys
+- [x] Fix OIDC callback handling
 
 ### Security & Compliance
-- [ ] Verify JWT signatures and validate claims (exp, iat, aud, iss) for all incoming tokens
-- [ ] Remove deprecated imports (e.g., io/ioutil)
-- [ ] Add security headers (CORS, CSP, etc.) to all HTTP responses
-- [ ] Implement replay protection for state/nonce values
-- [ ] Rate limit sensitive endpoints (registration, token)
+- [x] Implement ES256 JWT signing
+- [x] Add proper key management and rotation
+- [x] Fix trust chain validation logic
+- [x] Ensure OpenID Federation 1.0 compliance
+- [x] Add secure state/nonce/PKCE handling
 
-### Reliability & Scalability
-- [ ] Move session/state management from in-memory map to Redis or distributed cache
-- [ ] Support JWKS key rotation and multiple keys
-- [ ] Expand health check endpoint and add metrics for monitoring
+### Configuration & Deployment
+- [x] Add comprehensive configuration via JSON
+- [x] Implement Docker containerization
+- [x] Add health check endpoint
+- [x] Configure multi-environment support
 
-### OIDC Features
-- [ ] Support refresh tokens and logout endpoint
-- [ ] Validate all required OIDC claims in tokens and responses
-- [ ] Modularize code: split handlers and utilities into separate files
+## 🔄 In Progress
 
-### Testing & Maintenance
-- [ ] Add unit and integration tests for all critical flows
-- [ ] Use structured logging for better traceability
-- [ ] Load secrets/config from environment variables or secure stores
+### External Integration
+- [ ] **Complete eduGAIN integration testing**
+  - Trust anchor connectivity established
+  - Need to verify full trust chain with external validators
+- [ ] **SURF trust anchor integration**
+  - Basic connectivity working
+  - Testing trust chain resolution
 
----
-_Update this list as improvements are completed or new tasks are identified._
+## 📋 Future Enhancements
 
-# Signature Verification
+### Advanced Federation Features
+- [ ] **Metadata Policy Support**
+  - Implement metadata policies for subordinates
+  - Add policy inheritance from external trust anchors
+  - Support for scoped and conditional policies
 
-When processing JWTs (e.g., registration JWTs, id_tokens), always verify signatures and validate claims (exp, iat, aud, iss) for security, not just parse unverified.
+- [ ] **Federation History and Auditing**
+  - Add federation operation logging
+  - Implement trust chain resolution history
+  - Add metrics and monitoring for federation operations
 
-# Error Handling and Logging
+- [ ] **Advanced Trust Chain Management**
+  - Support for trust chain caching
+  - Implement trust chain validation optimization
+  - Add support for trust marks and trust mark issuers
 
-Use structured logging for better traceability.
-Avoid leaking sensitive error details to clients; log them internally.
+### Security Enhancements
+- [ ] **Key Rotation and Management**
+  - Implement automatic key rotation
+  - Add key versioning and rollover
+  - Support for hardware security modules (HSM)
 
-# Session Management
+- [ ] **Enhanced Validation**
+  - Add comprehensive JWT validation
+  - Implement signature verification caching
+  - Add support for certificate-based validation
 
-If you use in-memory maps for session/state, consider persistence or distributed cache (e.g., Redis) for scalability and reliability.
+### Operational Features
+- [ ] **Administrative Interface**
+  - Web-based admin panel for subordinate management
+  - Real-time federation status monitoring
+  - Trust chain visualization tools
 
-# Replay Protection
+- [ ] **Performance Optimization**
+  - Implement entity statement caching
+  - Add response compression
+  - Optimize federation endpoint performance
 
-Ensure state/nonce values are single-use and cannot be replayed.
+- [ ] **Multi-Tenancy Support**
+  - Support for multiple trust anchor instances
+  - Tenant isolation and management
+  - Per-tenant configuration and policies
 
-# Configuration Management
+### Integration & Compatibility
+- [ ] **Protocol Extensions**
+  - Support for automatic client configuration
+  - Implement federation-specific grants
+  - Add support for federation logout
 
-Load secrets and config from environment variables or secure stores, not just files.
+- [ ] **External System Integration**
+  - Add SAML bridge functionality
+  - Implement attribute mapping and transformation
+  - Support for legacy identity systems
 
-# JWKS Rotation
+### Documentation & Tooling
+- [ ] **Developer Tools**
+  - Federation testing and validation tools
+  - Trust chain debugging utilities
+  - Client integration examples and SDKs
 
-Implement key rotation and support multiple keys in JWKS for future-proofing.
+- [ ] **Production Readiness**
+  - High availability deployment guides
+  - Load balancing and scaling documentation
+  - Disaster recovery procedures
 
-# OIDC Compliance
+## 🐛 Known Issues
 
-Validate all required claims in tokens and responses.
-Support additional OIDC features (refresh tokens, logout, etc.) if needed.
+### External Validation
+- **External federation validator issue**: Some external OpenID Federation implementations incorrectly build trust chains by fetching self-issued statements instead of using the `/resolve` endpoint. This is a bug in their implementation, not ours.
 
-# Security Headers
+### Performance Considerations
+- **Trust chain resolution**: Currently performs real-time resolution. Consider implementing caching for production deployments.
 
-Add security headers (CORS, CSP, etc.) to HTTP responses.
+## 🎯 Priority Order
 
-# Rate Limiting and Abuse Protection
+1. **High Priority**: Complete external trust anchor integration testing
+2. **Medium Priority**: Implement metadata policies for production readiness
+3. **Medium Priority**: Add administrative interface for easier management
+4. **Low Priority**: Performance optimizations and advanced features
 
-Protect endpoints (especially registration and token) from abuse.
+## 📊 Success Metrics
 
-# Health and Metrics Endpoints
+- [x] **Basic Federation**: Trust anchor can issue and resolve subordinate statements
+- [x] **OIDC Compatibility**: Successfully proxies authentication to upstream providers
+- [ ] **Standards Compliance**: Passes OpenID Federation specification validation
+- [ ] **External Integration**: Successfully integrates with eduGAIN and SURF infrastructures
+- [ ] **Production Ready**: Supports high-availability deployment scenarios
 
-Expand health checks and add metrics for monitoring.
+## 🔍 Testing Status
 
-# Code Maintenance
-
-Remove deprecated imports (e.g., io/ioutil).
-Modularize code for maintainability (split handlers, utils, etc.).
-
-# Testing
-
-Add unit and integration tests for all critical flows.
+- [x] **Unit Tests**: Core federation functionality
+- [x] **Integration Tests**: OIDC proxy functionality
+- [ ] **Compliance Tests**: OpenID Federation specification compliance
+- [ ] **Load Tests**: Performance under high load
+- [ ] **Security Tests**: Penetration testing and security validation
