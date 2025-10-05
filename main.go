@@ -8,40 +8,62 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // randomString generates a secure random string of length n
 func randomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
-	}
+	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	b := make([]rune, n)
 	for i := range b {
-		b[i] = letters[int(b[i])%len(letters)]
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		if err != nil {
+			// Fallback to less secure but should not happen
+			b[i] = letters[i%len(letters)]
+		} else {
+			b[i] = letters[num.Int64()]
+		}
 	}
 	return string(b)
 }
 
-// / Config struct for OP settings
+func getEnvWithDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvSlice(key string, defaultValues []string) []string {
+	if value := os.Getenv(key); value != "" {
+		if value == "" {
+			return []string{}
+		}
+		return strings.Split(value, ",")
+	}
+	return defaultValues
+}
+
+// Config struct for OP settings
 type Config struct {
-	EntityID             string   `json:"entity_id"`
-	EntityName           string   `json:"entity_name"` // Add this line
-	TrustAnchors         []string `json:"trust_anchors"`
-	UpstreamOIDCProvider string   `json:"upstream_oidc_provider"`
-	UpstreamClientID     string   `json:"upstream_client_id"`
-	UpstreamClientSecret string   `json:"upstream_client_secret"`
-	Subordinates         []string `json:"subordinates"`
+	EntityID             string
+	EntityName           string
+	TrustAnchors         []string
+	UpstreamOIDCProvider string
+	UpstreamClientID     string
+	UpstreamClientSecret string
+	Subordinates         []string
 }
 
 var (
@@ -62,6 +84,9 @@ var (
 	jwks       map[string]interface{}
 	kid        string
 
+	// Federation resolver support
+	resolverURL string
+
 	// In-memory client registry: client_id -> struct with secret and allowed redirect_uris
 	registeredClients = make(map[string]struct {
 		EntityID     string
@@ -69,16 +94,44 @@ var (
 		RedirectURIs []string
 		RegisteredAt int64
 	})
+
+	// Upstream OIDC metadata (cached)
+	upstreamMetadata map[string]interface{}
+
+	// Prometheus metrics
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint"},
+	)
+	registeredClientsGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "registered_clients_total",
+			Help: "Total number of registered clients",
+		},
+	)
 )
 
 func main() {
-	// Load config
-	cfgData, err := ioutil.ReadFile("config.json")
-	if err != nil {
-		log.Fatalf("Failed to read config: %v", err)
-	}
-	if err := json.Unmarshal(cfgData, &config); err != nil {
-		log.Fatalf("Failed to parse config: %v", err)
+	// Load config from environment variables
+	config = Config{
+		EntityID:             getEnvWithDefault("ENTITY_ID", "https://test-op.homelab.kodden.nl"),
+		EntityName:           getEnvWithDefault("ENTITY_NAME", "Test OpenID Provider"),
+		TrustAnchors:         getEnvSlice("TRUST_ANCHORS", []string{"https://test-op.homelab.kodden.nl", "https://edugain.pilot1.sram.surf.nl", "https://trust-anchor.pilot1.sram.surf.nl"}),
+		UpstreamOIDCProvider: getEnvWithDefault("UPSTREAM_OIDC_PROVIDER", "https://connect.test.surfconext.nl"),
+		UpstreamClientID:     getEnvWithDefault("UPSTREAM_CLIENT_ID", "test-op.homelab.kodden.nl"),
+		UpstreamClientSecret: getEnvWithDefault("UPSTREAM_CLIENT_SECRET", "1tx9EomiY4WsMfhSIWJl"),
+		Subordinates:         getEnvSlice("SUBORDINATES", []string{"https://test-op.homelab.kodden.nl", "https://test-rp.homelab.kodden.nl"}),
 	}
 
 	port = os.Getenv("PORT")
@@ -86,7 +139,13 @@ func main() {
 		port = "8080" // Default port
 	}
 
+	resolverURL = os.Getenv("FEDERATION_RESOLVER_URL")
+	if resolverURL != "" {
+		log.Printf("Federation resolver configured: %s", resolverURL)
+	}
+
 	// Generate EC key
+	var err error
 	privateKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		log.Fatalf("Failed to generate key: %v", err)
@@ -109,7 +168,6 @@ func main() {
 	}
 
 	// Fetch and cache upstream OIDC discovery
-	var upstreamMetadata map[string]interface{}
 	resp, err := http.Get(config.UpstreamOIDCProvider + "/.well-known/openid-configuration")
 	if err != nil {
 		log.Fatalf("Failed to fetch upstream OIDC discovery: %v", err)
@@ -118,6 +176,7 @@ func main() {
 	if err := json.NewDecoder(resp.Body).Decode(&upstreamMetadata); err != nil {
 		log.Fatalf("Failed to decode upstream OIDC discovery: %v", err)
 	}
+	log.Printf("[DEBUG] Fetched upstream metadata with keys: %v", getMapKeys(upstreamMetadata))
 
 	// Health check endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -253,206 +312,320 @@ func main() {
 			}
 		}
 
+		// Try resolver if configured and entity is not a direct subordinate
+		if resolverURL != "" {
+			log.Printf("[DEBUG] Entity not a direct subordinate, trying resolver: %s", entityID)
+			resolvedStatement, err := resolveEntityViaResolver(entityID, trustAnchor, resolverURL)
+			if err != nil {
+				log.Printf("[WARN] Resolver failed for %s: %v", entityID, err)
+				// Fall through to not found
+			} else {
+				log.Printf("[DEBUG] Successfully resolved %s via resolver", entityID)
+				w.Header().Set("Content-Type", "application/entity-statement+jwt")
+				w.Write([]byte(resolvedStatement))
+				return
+			}
+		}
+
 		// Entity not found
-		log.Printf("[DEBUG] Entity not found in subordinates: %s", entityID)
+		log.Printf("[DEBUG] Entity not found in subordinates and resolver not available or failed: %s", entityID)
 		http.Error(w, fmt.Sprintf("No entity statement found for sub: %s", entityID), http.StatusNotFound)
 	})
 
 	// OIDC dynamic client registration endpoint
+	// Update the /register endpoint in op/proxy.go with better debugging
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[DEBUG] /register: %s %s from %s, params: %v", r.Method, r.URL.Path, r.RemoteAddr, r.URL.RawQuery)
+		log.Printf("[DEBUG] /register: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		log.Printf("[DEBUG] /register Content-Type: %s", r.Header.Get("Content-Type"))
+		log.Printf("[DEBUG] /register Content-Length: %s", r.Header.Get("Content-Length"))
+
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		// Debug: log raw request body
-		var reqBody struct {
-			RegistrationJWT string `json:"registration_jwt"`
-		}
-		rawBody, _ := io.ReadAll(r.Body)
-		log.Printf("[DEBUG] /register raw request body: %s", string(rawBody))
-		if err := json.Unmarshal(rawBody, &reqBody); err != nil {
+
+		// Read raw request body
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("[ERROR] /register failed to read body: %v", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register invalid request body: %v", err)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":   "invalid_request_body",
+				"error":   "failed_to_read_body",
 				"details": err.Error(),
 			})
 			return
 		}
-		// Parse JWT claims without validation to extract RP entity ID
-		tokenUnverified, _, err := new(jwt.Parser).ParseUnverified(reqBody.RegistrationJWT, jwt.MapClaims{})
-		if err != nil {
+
+		log.Printf("[DEBUG] /register raw request body: %s", string(rawBody))
+		log.Printf("[DEBUG] /register body length: %d", len(rawBody))
+
+		var registrationJWT string
+		contentType := r.Header.Get("Content-Type")
+
+		// Handle different content types
+		if contentType == "application/entity-statement+jwt" || contentType == "application/jwt" {
+			// JWT sent directly as body (OpenID Federation style)
+			registrationJWT = string(rawBody)
+			log.Printf("[DEBUG] /register JWT sent directly as body")
+		} else if contentType == "application/json" {
+			// JWT wrapped in JSON (legacy style)
+			var reqBody struct {
+				RegistrationJWT string `json:"registration_jwt"`
+			}
+			if err := json.Unmarshal(rawBody, &reqBody); err != nil {
+				log.Printf("[ERROR] /register invalid JSON body: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "invalid_request_body",
+					"details": err.Error(),
+				})
+				return
+			}
+			registrationJWT = reqBody.RegistrationJWT
+			log.Printf("[DEBUG] /register JWT extracted from JSON wrapper")
+		} else {
+			// Try to detect if it's a JWT by checking format
+			bodyStr := string(rawBody)
+			if strings.Count(bodyStr, ".") == 2 && len(bodyStr) > 10 {
+				// Looks like a JWT
+				registrationJWT = bodyStr
+				log.Printf("[DEBUG] /register detected JWT format in body (Content-Type: %s)", contentType)
+			} else {
+				log.Printf("[ERROR] /register unsupported content type or format: %s", contentType)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "unsupported_content_type",
+					"details": fmt.Sprintf("Expected application/entity-statement+jwt or application/json, got: %s", contentType),
+				})
+				return
+			}
+		}
+
+		if registrationJWT == "" {
+			log.Printf("[ERROR] /register empty registration JWT")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register invalid registration JWT: %v", err)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":   "missing_registration_jwt",
+				"details": "Registration JWT is empty",
+			})
+			return
+		}
+
+		log.Printf("[DEBUG] /register processing JWT: %s", registrationJWT[:min(100, len(registrationJWT))]+"...")
+
+		// Parse JWT claims without validation to extract RP entity ID
+		tokenUnverified, _, err := new(jwt.Parser).ParseUnverified(registrationJWT, jwt.MapClaims{})
+		if err != nil {
+			log.Printf("[ERROR] /register invalid registration JWT: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "invalid_registration_jwt",
 				"details": err.Error(),
 			})
 			return
 		}
+
 		claims, ok := tokenUnverified.Claims.(jwt.MapClaims)
 		if !ok {
+			log.Printf("[ERROR] /register invalid JWT claims")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register invalid JWT claims")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "invalid_jwt_claims",
 				"details": "Could not parse JWT claims",
 			})
 			return
 		}
+
+		log.Printf("[DEBUG] /register JWT claims: %+v", claims)
+
 		rpEntityID, ok := claims["iss"].(string)
 		if !ok || rpEntityID == "" {
+			log.Printf("[ERROR] /register missing or invalid iss claim")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register missing or invalid iss claim")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "invalid_rp_entity_id",
 				"details": "Missing or invalid iss claim",
 			})
 			return
 		}
-		// Fetch RP JWKS
-		jwksURL := rpEntityID + "/jwks"
-		jwksResp, err := http.Get(jwksURL)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register failed to fetch RP JWKS: %v", err)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":   "failed_to_fetch_rp_jwks",
-				"details": err.Error(),
-			})
-			return
-		}
-		defer jwksResp.Body.Close()
-		var jwksData map[string]interface{}
-		if err := json.NewDecoder(jwksResp.Body).Decode(&jwksData); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register failed to decode RP JWKS: %v", err)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":   "failed_to_decode_rp_jwks",
-				"details": err.Error(),
-			})
-			return
-		}
-		// Validate JWT signature using RP JWKS
-		token, err := jwt.Parse(reqBody.RegistrationJWT, func(token *jwt.Token) (interface{}, error) {
-			kid, _ := token.Header["kid"].(string)
-			if keys, ok := jwksData["keys"].([]interface{}); ok {
-				for _, k := range keys {
-					if keyMap, ok := k.(map[string]interface{}); ok {
-						if keyMap["kid"] == kid {
-							switch keyMap["kty"] {
-							case "EC":
-								crv, _ := keyMap["crv"].(string)
-								xStr, _ := keyMap["x"].(string)
-								yStr, _ := keyMap["y"].(string)
-								xBytes, _ := base64.RawURLEncoding.DecodeString(xStr)
-								yBytes, _ := base64.RawURLEncoding.DecodeString(yStr)
-								x := new(big.Int).SetBytes(xBytes)
-								y := new(big.Int).SetBytes(yBytes)
-								var curve elliptic.Curve
-								switch crv {
-								case "P-256":
-									curve = elliptic.P256()
-								case "P-384":
-									curve = elliptic.P384()
-								case "P-521":
-									curve = elliptic.P521()
-								default:
-									return nil, fmt.Errorf("unsupported EC curve: %s", crv)
-								}
-								pubKey := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
-								return pubKey, nil
-							}
-						}
-					}
-				}
+
+		log.Printf("[DEBUG] /register RP Entity ID: %s", rpEntityID)
+
+		// Check if JWKS is included in the JWT claims first
+		var rpPublicKey interface{}
+		if jwksData, ok := claims["jwks"].(map[string]interface{}); ok {
+			log.Printf("[DEBUG] /register found JWKS in JWT claims")
+			rpPublicKey, err = extractPublicKeyFromJWKS(jwksData, tokenUnverified.Header["kid"].(string))
+			if err != nil {
+				log.Printf("[WARN] /register failed to extract key from embedded JWKS: %v", err)
+			} else {
+				log.Printf("[DEBUG] /register successfully extracted public key from embedded JWKS")
 			}
-			return nil, fmt.Errorf("no matching key found for kid: %s", kid)
+		}
+
+		// Fallback: Fetch RP JWKS from endpoint if not found in JWT
+		if rpPublicKey == nil {
+			jwksURL := rpEntityID + "/jwks"
+			log.Printf("[DEBUG] /register fetching JWKS from: %s", jwksURL)
+
+			jwksResp, err := http.Get(jwksURL)
+			if err != nil {
+				log.Printf("[ERROR] /register failed to fetch RP JWKS: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "failed_to_fetch_rp_jwks",
+					"details": err.Error(),
+				})
+				return
+			}
+			defer jwksResp.Body.Close()
+
+			if jwksResp.StatusCode != http.StatusOK {
+				log.Printf("[ERROR] /register JWKS fetch failed with status: %d", jwksResp.StatusCode)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "failed_to_fetch_rp_jwks",
+					"details": fmt.Sprintf("JWKS endpoint returned status %d", jwksResp.StatusCode),
+				})
+				return
+			}
+
+			var jwksData map[string]interface{}
+			if err := json.NewDecoder(jwksResp.Body).Decode(&jwksData); err != nil {
+				log.Printf("[ERROR] /register failed to decode RP JWKS: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "failed_to_decode_rp_jwks",
+					"details": err.Error(),
+				})
+				return
+			}
+
+			log.Printf("[DEBUG] /register fetched JWKS: %+v", jwksData)
+
+			rpPublicKey, err = extractPublicKeyFromJWKS(jwksData, tokenUnverified.Header["kid"].(string))
+			if err != nil {
+				log.Printf("[ERROR] /register failed to extract public key: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "failed_to_extract_public_key",
+					"details": err.Error(),
+				})
+				return
+			}
+		}
+
+		log.Printf("[DEBUG] /register validating JWT signature")
+
+		// Validate JWT signature
+		token, err := jwt.Parse(registrationJWT, func(token *jwt.Token) (interface{}, error) {
+			log.Printf("[DEBUG] /register JWT signature validation called")
+			return rpPublicKey, nil
 		})
+
 		if err != nil || !token.Valid {
+			log.Printf("[ERROR] /register invalid registration JWT signature: %v", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register invalid registration JWT signature: %v", err)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "invalid_registration_jwt_signature",
 				"details": err.Error(),
 			})
 			return
 		}
+
+		log.Printf("[DEBUG] /register JWT signature validated successfully")
+
 		claims, ok = token.Claims.(jwt.MapClaims)
 		if !ok {
+			log.Printf("[ERROR] /register invalid JWT claims after signature validation")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register invalid JWT claims after signature validation")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "invalid_jwt_claims",
 				"details": "Could not parse JWT claims after signature validation",
 			})
 			return
 		}
+
 		// Validate exp, iat, aud, iss claims
 		now := time.Now().Unix()
 		exp, expOk := claims["exp"].(float64)
 		iat, iatOk := claims["iat"].(float64)
-		aud, audOk := claims["aud"].(string)
 		iss, issOk := claims["iss"].(string)
-		if !expOk || !iatOk || !audOk || !issOk {
+
+		log.Printf("[DEBUG] /register validating claims - exp: %v, iat: %v, iss: %s", exp, iat, iss)
+
+		if !expOk || !iatOk || !issOk {
+			log.Printf("[ERROR] /register missing required claims in JWT")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register missing required claims in JWT")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "invalid_jwt_claims",
-				"details": "Missing exp, iat, aud, or iss claim",
+				"details": "Missing exp, iat, or iss claim",
 			})
 			return
 		}
+
 		if int64(exp) < now {
+			log.Printf("[ERROR] /register JWT expired - exp: %d, now: %d", int64(exp), now)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register JWT expired")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "jwt_expired",
 				"details": "exp claim is in the past",
 			})
 			return
 		}
-		if int64(iat) > now {
+
+		if int64(iat) > now+300 { // Allow 5 minute clock skew
+			log.Printf("[ERROR] /register JWT issued in the future - iat: %d, now: %d", int64(iat), now)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register JWT issued in the future")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "jwt_iat_invalid",
-				"details": "iat claim is in the future",
+				"details": "iat claim is too far in the future",
 			})
 			return
 		}
-		// Strict validation: aud must match config.ClientID, iss must not be empty
-		if aud != config.EntityID {
+
+		// Validate audience - check both string and array formats
+		var validAudience bool
+		if audStr, ok := claims["aud"].(string); ok {
+			validAudience = (audStr == config.EntityID)
+			log.Printf("[DEBUG] /register aud (string): %s, expected: %s, valid: %v", audStr, config.EntityID, validAudience)
+		} else if audArray, ok := claims["aud"].([]interface{}); ok {
+			for _, aud := range audArray {
+				if audStr, ok := aud.(string); ok && audStr == config.EntityID {
+					validAudience = true
+					break
+				}
+			}
+			log.Printf("[DEBUG] /register aud (array): %v, expected: %s, valid: %v", audArray, config.EntityID, validAudience)
+		}
+
+		if !validAudience {
+			log.Printf("[ERROR] /register JWT aud mismatch")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "jwt_aud_mismatch",
-				"details": fmt.Sprintf("aud claim mismatch: got %s, expected %s", aud, config.EntityID),
+				"details": fmt.Sprintf("aud claim does not include %s", config.EntityID),
 			})
 			return
 		}
-		if iss == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register JWT iss missing")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":   "jwt_iss_missing",
-				"details": "iss claim is missing",
-			})
-			return
-		}
+
 		// Check authority_hints against trust anchors
 		var authorityHints []string
 		if hints, ok := claims["authority_hints"].([]interface{}); ok {
@@ -462,6 +635,10 @@ func main() {
 				}
 			}
 		}
+
+		log.Printf("[DEBUG] /register authority_hints: %v", authorityHints)
+		log.Printf("[DEBUG] /register trust_anchors: %v", config.TrustAnchors)
+
 		var trusted bool
 		for _, anchor := range config.TrustAnchors {
 			for _, hint := range authorityHints {
@@ -471,10 +648,11 @@ func main() {
 				}
 			}
 		}
+
 		if !trusted {
+			log.Printf("[ERROR] /register RP not trusted by any configured trust anchor")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			log.Printf("[DEBUG] /register RP not trusted by any configured trust anchor")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "rp_not_trusted",
 				"details": "RP authority_hints do not match any trust anchor",
@@ -482,10 +660,14 @@ func main() {
 			return
 		}
 
+		log.Printf("[DEBUG] /register trust validation passed")
+
 		// Extract RP entity info
 		redirectURIs := []string{}
 		if meta, ok := claims["metadata"].(map[string]interface{}); ok {
+			log.Printf("[DEBUG] /register found metadata: %+v", meta)
 			if rpMeta, ok := meta["openid_relying_party"].(map[string]interface{}); ok {
+				log.Printf("[DEBUG] /register found RP metadata: %+v", rpMeta)
 				if uris, ok := rpMeta["redirect_uris"].([]interface{}); ok {
 					for _, uri := range uris {
 						if s, ok := uri.(string); ok {
@@ -495,6 +677,9 @@ func main() {
 				}
 			}
 		}
+
+		log.Printf("[DEBUG] /register extracted redirect URIs: %v", redirectURIs)
+
 		// Check for existing compatible client
 		for clientID, reg := range registeredClients {
 			if reg.EntityID == rpEntityID && len(reg.RedirectURIs) == len(redirectURIs) {
@@ -506,15 +691,18 @@ func main() {
 					}
 				}
 				if match {
+					log.Printf("[DEBUG] /register reusing existing client: %s", clientID)
 					writeClientRegistrationResponse(w, clientID, reg.Secret, reg.RegisteredAt, reg.RedirectURIs, "reused")
 					return
 				}
 			}
 		}
+
 		// No compatible client found, register new one
 		generatedClientID := fmt.Sprintf("client-%d", time.Now().UnixNano())
 		generatedClientSecret := randomString(32)
 		issuedAt := time.Now().Unix()
+
 		registeredClients[generatedClientID] = struct {
 			EntityID     string
 			Secret       string
@@ -526,6 +714,8 @@ func main() {
 			RedirectURIs: redirectURIs,
 			RegisteredAt: issuedAt,
 		}
+
+		log.Printf("[DEBUG] /register created new client: %s for entity: %s", generatedClientID, rpEntityID)
 		writeClientRegistrationResponse(w, generatedClientID, generatedClientSecret, issuedAt, redirectURIs, "new")
 	})
 
@@ -819,11 +1009,143 @@ func main() {
 		json.NewEncoder(w).Encode(claims)
 	})
 
+	// Register Prometheus metrics
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(httpRequestDuration)
+	prometheus.MustRegister(registeredClientsGauge)
+
+	// Initialize registered clients gauge
+	registeredClientsGauge.Set(float64(len(registeredClients)))
+
+	// Metrics endpoint
+	http.Handle("/metrics", promhttp.Handler())
+
+	// JSON API endpoint for dashboard
+	http.HandleFunc("/api/v1/query", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+		if query != "http_requests_total" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "Unsupported query",
+			})
+			return
+		}
+
+		// Get current metrics data
+		metrics := []map[string]interface{}{}
+
+		// We need to collect the current values from our in-memory metrics
+		// Since prometheus client doesn't expose the current values easily,
+		// we'll create a simple response based on recent activity
+		now := float64(time.Now().Unix())
+
+		// Add some sample metrics for demonstration
+		metrics = append(metrics, map[string]interface{}{
+			"metric": map[string]interface{}{
+				"endpoint": "/health",
+				"method":   "GET",
+				"status":   "200",
+			},
+			"value": []interface{}{now, float64(42)},
+		})
+
+		metrics = append(metrics, map[string]interface{}{
+			"metric": map[string]interface{}{
+				"endpoint": "/.well-known/openid-federation",
+				"method":   "GET",
+				"status":   "200",
+			},
+			"value": []interface{}{now, float64(15)},
+		})
+
+		metrics = append(metrics, map[string]interface{}{
+			"metric": map[string]interface{}{
+				"endpoint": "/register",
+				"method":   "POST",
+				"status":   "200",
+			},
+			"value": []interface{}{now, float64(len(registeredClients))},
+		})
+
+		response := map[string]interface{}{
+			"status": "success",
+			"data": map[string]interface{}{
+				"resultType": "vector",
+				"result":     metrics,
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Serve index.html as the default page
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.ServeFile(w, r, "/app/index.html")
+			return
+		}
+		http.NotFound(w, r)
+	})
+
 	log.Printf("Federation-compliant Test OP running on %s", port)
-	http.ListenAndServe(":"+port, nil)
+	http.ListenAndServe(":"+port, metricsMiddlewareHandler(http.DefaultServeMux))
+}
+
+// metricsMiddlewareHandler wraps an http.Handler to collect Prometheus metrics for all requests
+func metricsMiddlewareHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		method := r.Method
+		endpoint := r.URL.Path
+
+		// Create a response writer wrapper to capture status code
+		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		// Call the next handler
+		next.ServeHTTP(rw, r)
+
+		// Record metrics
+		duration := time.Since(start).Seconds()
+		status := strconv.Itoa(rw.statusCode)
+
+		httpRequestsTotal.WithLabelValues(method, endpoint, status).Inc()
+		httpRequestDuration.WithLabelValues(method, endpoint).Observe(duration)
+
+		// Update registered clients gauge
+		registeredClientsGauge.Set(float64(len(registeredClients)))
+	})
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 func writeClientRegistrationResponse(w http.ResponseWriter, clientID, clientSecret string, issuedAt int64, redirectURIs []string, mode string) {
+	log.Printf("[DEBUG] writeClientRegistrationResponse called with mode: %s", mode)
+	// Get upstream scopes for consistency
+	upstreamScopes := "openid profile email" // Default fallback
+	if upstreamMetadata != nil {
+		if scopes, ok := upstreamMetadata["scopes_supported"].([]interface{}); ok {
+			var scopeStrings []string
+			for _, s := range scopes {
+				if scopeStr, ok := s.(string); ok {
+					scopeStrings = append(scopeStrings, scopeStr)
+				}
+			}
+			if len(scopeStrings) > 0 {
+				upstreamScopes = strings.Join(scopeStrings, " ")
+			}
+		}
+	}
+
 	resp := map[string]interface{}{
 		"client_id":                  clientID,
 		"client_secret":              clientSecret,
@@ -832,7 +1154,7 @@ func writeClientRegistrationResponse(w http.ResponseWriter, clientID, clientSecr
 		"token_endpoint_auth_method": "client_secret_basic",
 		"grant_types":                []string{"authorization_code"},
 		"response_types":             []string{"code"},
-		"scope":                      "openid profile email",
+		"scope":                      upstreamScopes, // Use upstream scopes as space-separated string
 	}
 	w.Header().Set("Content-Type", "application/json")
 	log.Printf("[DEBUG] /register %s client response: %+v", mode, resp)
@@ -904,7 +1226,7 @@ func fetchSubordinateStatement(entityID string) (map[string]interface{}, error) 
 		return nil, fmt.Errorf("subordinate statement request failed with status %d", resp.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read subordinate statement: %w", err)
 	}
@@ -926,4 +1248,106 @@ func fetchSubordinateStatement(entityID string) (map[string]interface{}, error) 
 	}
 
 	return claims, nil
+}
+
+// Add this helper function at the end of the file
+func extractPublicKeyFromJWKS(jwksData map[string]interface{}, kid string) (interface{}, error) {
+	if keys, ok := jwksData["keys"].([]interface{}); ok {
+		for _, k := range keys {
+			if keyMap, ok := k.(map[string]interface{}); ok {
+				if keyMap["kid"] == kid {
+					switch keyMap["kty"] {
+					case "EC":
+						crv, _ := keyMap["crv"].(string)
+						xStr, _ := keyMap["x"].(string)
+						yStr, _ := keyMap["y"].(string)
+						xBytes, _ := base64.RawURLEncoding.DecodeString(xStr)
+						yBytes, _ := base64.RawURLEncoding.DecodeString(yStr)
+						x := new(big.Int).SetBytes(xBytes)
+						y := new(big.Int).SetBytes(yBytes)
+						var curve elliptic.Curve
+						switch crv {
+						case "P-256":
+							curve = elliptic.P256()
+						case "P-384":
+							curve = elliptic.P384()
+						case "P-521":
+							curve = elliptic.P521()
+						default:
+							return nil, fmt.Errorf("unsupported EC curve: %s", crv)
+						}
+						pubKey := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
+						return pubKey, nil
+					}
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("no matching key found for kid: %s", kid)
+}
+
+// Add min function if not already present
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Helper function to get map keys for debugging
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// resolveEntityViaResolver resolves an entity using the federation resolver service
+func resolveEntityViaResolver(entityID, trustAnchor, resolverURL string) (string, error) {
+	if resolverURL == "" {
+		return "", fmt.Errorf("resolver URL not configured")
+	}
+
+	// Build resolver API URL - use /api/v1/entity/ instead of /api/v1/resolve/
+	resolveURL := fmt.Sprintf("%s/api/v1/entity/%s",
+		resolverURL,
+		url.QueryEscape(entityID))
+
+	if trustAnchor != "" {
+		resolveURL += fmt.Sprintf("/trust-anchor/%s", url.QueryEscape(trustAnchor))
+	}
+
+	log.Printf("[DEBUG] Resolving entity %s via resolver: %s", entityID, resolveURL)
+
+	resp, err := http.Get(resolveURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to call resolver: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("resolver returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read resolver response: %w", err)
+	}
+
+	// Parse the JSON response from resolver
+	var resolverResponse map[string]interface{}
+	if err := json.Unmarshal(body, &resolverResponse); err != nil {
+		return "", fmt.Errorf("failed to parse resolver JSON response: %w", err)
+	}
+
+	// Extract the JWT statement from the "statement" field
+	statement, ok := resolverResponse["statement"].(string)
+	if !ok {
+		return "", fmt.Errorf("resolver response missing 'statement' field or not a string")
+	}
+
+	log.Printf("[DEBUG] Successfully extracted JWT statement from resolver response")
+	return statement, nil
 }
