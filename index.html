@@ -1,47 +1,538 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Federation PROXY Metrics</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenID Federation Provider</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .metric { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; }
-        .value { font-size: 24px; font-weight: bold; color: #2e7d32; }
-        .label { color: #666; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .status-card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            margin-bottom: 25px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            border-left: 4px solid #28a745;
+        }
+
+        .status-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            background: #28a745;
+            border-radius: 50%;
+            margin-right: 10px;
+            animation: pulse 2s infinite;
+        }
+
+        .status-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 25px;
+            margin-bottom: 25px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 40px rgba(0,0,0,0.15);
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .card-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 15px;
+            font-size: 1.2rem;
+        }
+
+        .card-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .metric-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+
+        .metric-label {
+            color: #7f8c8d;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .client-list {
+            list-style: none;
+        }
+
+        .client-item {
+            padding: 15px;
+            border: 1px solid #ecf0f1;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+        }
+
+        .client-id {
+            font-family: monospace;
+            font-weight: 600;
+            color: #e74c3c;
+            margin-bottom: 5px;
+        }
+
+        .client-details {
+            font-size: 0.9rem;
+            color: #7f8c8d;
+        }
+
+        .client-entity {
+            color: #3498db;
+            font-weight: 500;
+        }
+
+        .federation-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .info-item {
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 3px solid #667eea;
+        }
+
+        .info-label {
+            font-weight: 600;
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+
+        .info-value {
+            color: #7f8c8d;
+            font-family: monospace;
+            font-size: 0.9rem;
+            word-break: break-all;
+        }
+
+        .activity-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .activity-item {
+            padding: 12px;
+            border-bottom: 1px solid #ecf0f1;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .activity-method {
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+        }
+
+        .method-GET { background: #d4edda; color: #155724; }
+        .method-POST { background: #cce5ff; color: #004085; }
+
+        .activity-endpoint {
+            flex: 1;
+            margin: 0 15px;
+            font-family: monospace;
+        }
+
+        .activity-count {
+            font-weight: 600;
+            color: #667eea;
+        }
+
+        .refresh-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            margin-top: 20px;
+            transition: background 0.2s ease;
+        }
+
+        .refresh-btn:hover {
+            background: #5a67d8;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .loading {
+            text-align: center;
+            color: #7f8c8d;
+            padding: 40px;
+        }
+
+        .error {
+            background: #fee;
+            border: 1px solid #fcc;
+            color: #c33;
+            padding: 15px;
+            border-radius: 6px;
+            margin: 15px 0;
+        }
     </style>
 </head>
 <body>
-    <h1>Federation Services Metrics</h1>
-    <div id="metrics"></div>
-    
+    <div class="container">
+        <div class="header">
+            <h1>🏛️ OpenID Federation Provider</h1>
+            <p id="entity-info">Loading...</p>
+        </div>
+
+        <div id="content">
+            <div class="loading">Loading dashboard...</div>
+        </div>
+
+        <div style="text-align: center;">
+            <button class="refresh-btn" onclick="loadDashboard()">🔄 Refresh Dashboard</button>
+        </div>
+    </div>
+
     <script>
-        async function updateMetrics() {
+        async function loadDashboard() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="loading">Loading dashboard...</div>';
+
             try {
-                const response = await fetch('/api/v1/query?query=http_requests_total');
-                const data = await response.json();
-                
-                let html = '';
-                data.data.result.forEach(metric => {
-                    const endpoint = metric.metric.endpoint;
-                    const method = metric.metric.method;
-                    const status = metric.metric.status;
-                    const value = metric.value[1];
-                    
-                    html += `
-                        <div class="metric">
-                            <div class="label">${method} ${endpoint} (${status})</div>
-                            <div class="value">${value}</div>
-                        </div>
-                    `;
-                });
-                
-                document.getElementById('metrics').innerHTML = html;
+                // Load health data
+                const healthResponse = await fetch('/health');
+                const health = await healthResponse.json();
+
+                // Update header with entity info
+                document.getElementById('entity-info').textContent = `${health.entity_name} - ${health.entity_id}`;
+
+                // Load metrics data
+                const metricsResponse = await fetch('/metrics');
+                const metricsText = await metricsResponse.text();
+                const metrics = parseMetrics(metricsText);
+
+                // Render dashboard
+                content.innerHTML = renderDashboard(health, metrics);
+
+                // Update uptime
+                updateUptime(health.timestamp);
+
             } catch (error) {
-                console.error('Error fetching metrics:', error);
+                content.innerHTML = `<div class="error">Error loading dashboard: ${error.message}</div>`;
             }
         }
-        
-        updateMetrics();
-        setInterval(updateMetrics, 5000); // Update every 5 seconds
+
+        function updateUptime(serverTimestamp) {
+            const now = Math.floor(Date.now() / 1000);
+            const uptime = now - serverTimestamp;
+
+            const hours = Math.floor(uptime / 3600);
+            const minutes = Math.floor((uptime % 3600) / 60);
+            const seconds = uptime % 60;
+
+            const uptimeStr = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+
+            document.getElementById('uptime').textContent = uptimeStr;
+            document.getElementById('last-check').textContent = new Date().toLocaleTimeString();
+        }
+
+        function parseMetrics(text) {
+            const lines = text.split('\n');
+            const metrics = {};
+
+            for (const line of lines) {
+                if (line.startsWith('http_requests_total{')) {
+                    const match = line.match(/http_requests_total\{endpoint="([^"]+)",method="([^"]+)",status="([^"]+)"\}\s+(\d+)/);
+                    if (match) {
+                        const [, endpoint, method, status, value] = match;
+                        if (!metrics.http_requests) metrics.http_requests = {};
+                        if (!metrics.http_requests[endpoint]) metrics.http_requests[endpoint] = {};
+                        metrics.http_requests[endpoint][`${method}_${status}`] = parseInt(value);
+                    }
+                } else if (line.startsWith('registered_clients_total')) {
+                    const match = line.match(/registered_clients_total\s+(\d+)/);
+                    if (match) {
+                        metrics.registered_clients_total = parseInt(match[1]);
+                    }
+                }
+            }
+
+            return metrics;
+        }
+
+        function renderDashboard(health, metrics) {
+            const totalRequests = Object.values(metrics.http_requests || {}).reduce((sum, endpoint) => {
+                return sum + Object.values(endpoint).reduce((endpointSum, count) => endpointSum + count, 0);
+            }, 0);
+
+            const successfulAuths = (metrics.http_requests?.['/token']?.['POST_200'] || 0) +
+                                   (metrics.http_requests?.['/authorize']?.['GET_302'] || 0);
+
+            return `
+                <!-- Status Card -->
+                <div class="status-card">
+                    <div class="status-header">
+                        <div class="status-indicator"></div>
+                        <div class="status-title">Service Status: ${health.status.toUpperCase()}</div>
+                    </div>
+                    <div class="federation-info">
+                        <div class="info-item">
+                            <div class="info-label">Entity ID</div>
+                            <div class="info-value">${health.entity_id}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">Entity Name</div>
+                            <div class="info-value">${health.entity_name}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">Trust Anchors</div>
+                            <div class="info-value">${health.trust_anchors.join(', ')}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">Subordinates</div>
+                            <div class="info-value">${health.subordinates.join(', ')}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Metrics Grid -->
+                <div class="grid">
+                    <!-- Registered Clients -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #667eea;">👥</div>
+                            <div class="card-title">Registered Clients</div>
+                        </div>
+                        <div class="metric-value">${health.registered_clients.length}</div>
+                        <div class="metric-label">Active Clients</div>
+                    </div>
+
+                    <!-- Total Requests -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #48bb78;">📊</div>
+                            <div class="card-title">Total Requests</div>
+                        </div>
+                        <div class="metric-value">${totalRequests}</div>
+                        <div class="metric-label">HTTP Requests Served</div>
+                    </div>
+
+                    <!-- Successful Authentications -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #ed8936;">🔐</div>
+                            <div class="card-title">Authentications</div>
+                        </div>
+                        <div class="metric-value">${successfulAuths}</div>
+                        <div class="metric-label">Successful Auth Flows</div>
+                    </div>
+
+                    <!-- Federation Requests -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #9f7aea;">🔗</div>
+                            <div class="card-title">Federation Activity</div>
+                        </div>
+                        <div class="metric-value">${metrics.http_requests?.['/.well-known/openid-federation']?.['GET_200'] || 0}</div>
+                        <div class="metric-label">Entity Statement Requests</div>
+                    </div>
+                    <!-- Federation Metadata -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #ed8936;">📄</div>
+                            <div class="card-title">Federation Metadata</div>
+                        </div>
+                        <div class="federation-info">
+                            <div class="info-item">
+                                <div class="info-label">Entity Type</div>
+                                <div class="info-value">OpenID Provider + Trust Anchor</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Supported Algorithms</div>
+                                <div class="info-value">ES256, RS256, HS256</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Registration</div>
+                                <div class="info-value">OpenID Federation (JWT)</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Discovery</div>
+                                <div class="info-value">/.well-known/openid-federation</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- System Info -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #38b2ac;">⚙️</div>
+                            <div class="card-title">System Status</div>
+                        </div>
+                        <div class="federation-info">
+                            <div class="info-item">
+                                <div class="info-label">Service Uptime</div>
+                                <div class="info-value" id="uptime">Loading...</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Last Health Check</div>
+                                <div class="info-value" id="last-check">Just now</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Active Sessions</div>
+                                <div class="info-value">0 pending</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Version</div>
+                                <div class="info-value">Federation OP v1.0</div>
+                            </div>
+                        </div>
+                    </div>
+                <div class="grid">
+                    <!-- Registered Clients Details -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #667eea;">📋</div>
+                            <div class="card-title">Client Registry</div>
+                        </div>
+                        <div class="client-list">
+                            ${health.registered_clients.length > 0 ?
+                                health.registered_clients.map(client => `
+                                    <div class="client-item">
+                                        <div class="client-id">${client.client_id}</div>
+                                        <div class="client-details">
+                                            <div><strong>Entity:</strong> <span class="client-entity">${client.client_id.split('-')[0] === 'client' ? 'Unknown' : client.client_id}</span></div>
+                                            <div><strong>Redirect URIs:</strong> ${client.redirect_uris.join(', ')}</div>
+                                            <div><strong>Registered:</strong> ${new Date(client.registered_at * 1000).toLocaleString()}</div>
+                                        </div>
+                                    </div>
+                                `).join('') :
+                                '<div style="text-align: center; color: #7f8c8d; padding: 20px;">No clients registered yet</div>'
+                            }
+                        </div>
+                    </div>
+
+                    <!-- Recent Activity -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: #48bb78;">📈</div>
+                            <div class="card-title">Endpoint Activity</div>
+                        </div>
+                        <div class="activity-list">
+                            ${renderActivityList(metrics.http_requests || {})}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderActivityList(requests) {
+            const endpoints = Object.keys(requests).sort();
+            if (endpoints.length === 0) {
+                return '<div style="text-align: center; color: #7f8c8d; padding: 20px;">No activity recorded</div>';
+            }
+
+            return endpoints.map(endpoint => {
+                const endpointData = requests[endpoint];
+                const methods = Object.keys(endpointData);
+
+                return methods.map(method => {
+                    const [httpMethod, status] = method.split('_');
+                    const count = endpointData[method];
+
+                    return `
+                        <div class="activity-item">
+                            <span class="activity-method method-${httpMethod}">${httpMethod}</span>
+                            <span class="activity-endpoint">${endpoint}</span>
+                            <span class="activity-count">${count} (${status})</span>
+                        </div>
+                    `;
+                }).join('');
+            }).join('');
+        }
+
+        // Load dashboard on page load
+        loadDashboard();
+
+        // Auto-refresh every 30 seconds
+        setInterval(loadDashboard, 30000);
     </script>
 </body>
 </html>
