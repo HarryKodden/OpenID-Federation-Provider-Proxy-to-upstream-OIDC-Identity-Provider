@@ -1309,13 +1309,13 @@ func resolveEntityViaResolver(entityID, trustAnchor, resolverURL string) (string
 		return "", fmt.Errorf("resolver URL not configured")
 	}
 
-	// Build resolver API URL - use /api/v1/entity/ instead of /api/v1/resolve/
+	// Build resolver API URL - use /api/v1/entity/ with trust_anchor as query parameter
 	resolveURL := fmt.Sprintf("%s/api/v1/entity/%s",
 		resolverURL,
 		url.QueryEscape(entityID))
 
 	if trustAnchor != "" {
-		resolveURL += fmt.Sprintf("/trust-anchor/%s", url.QueryEscape(trustAnchor))
+		resolveURL += fmt.Sprintf("?trust_anchor=%s", url.QueryEscape(trustAnchor))
 	}
 
 	log.Printf("[DEBUG] Resolving entity %s via resolver: %s", entityID, resolveURL)
